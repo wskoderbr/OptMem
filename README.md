@@ -1,5 +1,17 @@
 # OptMem
 
+## IM Agents fork — FileRedis
+
+This fork keeps the upstream memory algorithm and replaces its memory files with binary Redis strings. Each logical file (`LOG.txt`, `config`, `TREE/2`, ...) is one Redis key under a caller-supplied prefix. There is no Python/file lock: **all operations, including reads, must run under the Memory Worker's distributed prefix lock**. Do not call this CLI concurrently on the same prefix outside that boundary.
+
+Install `requirements.txt`, then invoke `python memo --redis-url <url> --memory-prefix <prefix> <command> [args...]`. Connection and prefix are mandatory; no filesystem fallback. The TypeScript engine supplies these options on every call. Native command text/exit codes are retained, including exit 1 when wake requires pending compression. The upstream instruction block below is historical CLI guidance, not the Agent World prompt contract.
+
+The original log/tree byte layout is retained. Configuration text uses UTF-8/LF. `init` is explicit and does not replace existing files. `import` still reads a local bootstrap input file; it is not exposed by the HTTP worker. Redis durability is controlled by the Redis deployment; memory file keys have no cache TTL.
+
+Tests: set `OPTMEM_TEST_REDIS_URL`, then `python -m unittest test_file_redis -v`. Uses disposable prefixes and compares against upstream commit `1fb164cf39028047781f72ac3bb1e5a691c1dcb0` available in this Git checkout. `test.py` is retained from upstream and exercises its original filesystem integration, not this Redis adapter.
+
+## Upstream documentation
+
 Permanent memory for AI agents. A 426-token prompt, a script, plug and play.
 
 ![how OptMem works](anim/optmem.gif)

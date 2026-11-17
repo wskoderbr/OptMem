@@ -11,15 +11,15 @@
   {memo} config [NAME=N]  show this memory's sizes, or change one.
   {memo} import <file>    bulk-load dated memories (bootstrap only).
 
-The memories live in ~/.optmem/memory, or in $MEMORY_DIR if set.
+Memory files are binary Redis strings under --memory-prefix; connection: --redis-url.
+All access must be serialized by the Memory Worker for the complete operation.
 See github.com/VictorTaelin/OptMem.
 """
 
+import argparse
 import datetime
-try:
-    import fcntl
-except ImportError:
-    fcntl = None  # Windows has no fcntl; we fall back to msvcrt below
+import redis
+from file_redis import FileRedis
 import os
 import re
 import sys
@@ -36,6 +36,8 @@ for _s in (sys.stdout, sys.stderr):
 
 def pretty(p):
     """A path as the user would type it: keep symlinks, fold $HOME to ~."""
+    if globals().get("FILES") is not None and p == FILES.prefix:
+        return p
     p, home = os.path.abspath(p), os.path.expanduser("~")
     return "~" + p[len(home):] if p.startswith(home + os.sep) else p
 
@@ -43,6 +45,7 @@ def pretty(p):
 # Every command this tool prints has to RUN. After `curl | sh` nothing is on
 # PATH, so a bare `memo nap 0-1 "..."` would not: the tool names itself.
 ME = pretty(__file__)
+FILES = None
 
 # The sizes a memory may override in its own `config` file: the default, and
 # what it means. `memo config` shows and edits them. The globals below start
@@ -134,25 +137,13 @@ def cover(T, budget):
 # ---------------------------------------------------------------- store
 
 def memory_dir():
-    return os.path.expanduser(os.environ.get("MEMORY_DIR") or "~/.optmem/memory")
-
+    return FILES.prefix
 
 def store():
     d = memory_dir()
-    # The directory is only ever created by `memo init`: creating it IS
-    # creating the identity, and that is a deliberate act. If any other
-    # command created it, a typo in MEMORY_DIR would silently open an empty
-    # store, and the agent would wake with no past and write a second
-    # identity.
-    if not os.path.isdir(d):
-        die("No memory at %s.\nTo create one, run: %s init\n"
-            "To use an existing one, point MEMORY_DIR at it." % (d, ME))
-    os.makedirs(os.path.join(d, "TREE"), exist_ok=True)
-    p = os.path.join(d, "LOG.txt")
-    if not os.path.exists(p):
-        open(p, "a").close()
+    if not FILES.exists(log_path(d)):
+        die("No memory at %s. Run init first." % d)
     return d
-
 
 def size(k, v, where=""):
     """Validate one knob, wherever it came from: the config file or argv. A
@@ -171,9 +162,9 @@ def overrides(d):
     """The knobs this memory sets for itself, read from its `config` file."""
     out = {}
     p = os.path.join(d, "config")
-    if not os.path.exists(p):
+    if not FILES.exists(p):
         return out
-    for n, line in enumerate(open(p, encoding="utf-8"), 1):
+    for n, line in enumerate(FILES.read(p).decode("utf-8").splitlines(), 1):
         line = line.split("#")[0].strip()
         if "=" not in line:
             continue
@@ -202,8 +193,7 @@ def write_config(d, over):
     for k, (default, what) in KNOBS.items():
         out.append("%-2s%-12s = %-6d # %s"
                    % ("" if k in over else "# ", k, over.get(k, default), what))
-    with open(os.path.join(d, "config"), "w", encoding="utf-8") as f:
-        f.write("\n".join(out) + "\n")
+    FILES.write(os.path.join(d, "config"), ("\n".join(out) + "\n").encode("utf-8"))
 
 
 def log_path(d):
@@ -215,28 +205,17 @@ def tree_path(d, size):
 
 
 def count(path, rec):
-    try:
-        return os.path.getsize(path) // rec
-    except FileNotFoundError:  # any other failure is real and must surface
-        return 0
-
+    return FILES.size(path) // rec
 
 def log_len(d):
     return count(log_path(d), LOG_REC)
 
 
 def repair(path, rec):
-    """Drop a partial trailing record left by a crash. It was never
-    acknowledged. Without this the next append lands at a wrong offset and
-    every later record is misaligned. Callers hold the lock."""
-    try:
-        n = os.path.getsize(path)
-    except FileNotFoundError:
-        return
+    """Preserve upstream handling of an incomplete trailing record."""
+    n = FILES.size(path)
     if n % rec:
-        with open(path, "r+b") as f:
-            f.truncate(n - n % rec)
-
+        FILES.truncate(path, n - n % rec)
 
 def parse(line):
     head, _, rest = line.partition(" ")
@@ -253,11 +232,7 @@ def records(buf):
 
 
 def log_slice(d, lo, hi):
-    """Memories [lo,hi) in one read."""
-    with open(log_path(d), "rb") as f:
-        f.seek(lo * LOG_REC)
-        return records(f.read((hi - lo) * LOG_REC))
-
+    return records(FILES.read(log_path(d), lo * LOG_REC, (hi - lo) * LOG_REC))
 
 def log_get(d, i):
     """(id, date, text) of memory i, in one seek."""
@@ -265,32 +240,23 @@ def log_get(d, i):
 
 
 def log_scan(d):
-    """Every memory, streamed. A search reads the whole log by nature, but it
-    must not HOLD it: at a million memories that is 300 MB."""
-    with open(log_path(d), "rb") as f:
-        while True:
-            buf = f.read(LOG_REC * 4096)
-            if not buf:
-                return
-            for e in records(buf):
-                yield e
-
+    """Stream the raw log in the same record-sized batches as upstream."""
+    offset = 0
+    while True:
+        buf = FILES.read(log_path(d), offset, LOG_REC * 4096)
+        if not buf:
+            return
+        yield from records(buf)
+        offset += len(buf)
 
 def tree_get(d, lo, hi):
-    """The summary of block [lo,hi), in one seek. None if not built yet."""
     size = hi - lo
-    try:
-        with open(tree_path(d, size), "rb") as f:
-            f.seek((lo // size) * TREE_REC)
-            rec = f.read(TREE_REC)
-    except FileNotFoundError:  # not built yet; any other failure is real
-        return None
+    rec = FILES.read(tree_path(d, size), (lo // size) * TREE_REC, TREE_REC)
     try:
         return rec.decode().rstrip() or None
     except UnicodeDecodeError:
         die("The summary of #%d-%d is corrupt. Run: %s forget %d-%d"
             % (lo, hi - 1, ME, lo, hi - 1))
-
 
 def pad(text, rec):
     b = text.encode()
@@ -299,95 +265,37 @@ def pad(text, rec):
     return b + b" " * (rec - 1 - len(b)) + b"\n"
 
 
-def locked(d):
-    # Open in append mode ("a"), NOT "w": reopening with "w" truncates the
-    # lock file and breaks advisory locks held by other processes on Windows.
-    lock = open(os.path.join(d, ".lock"), "a")
-    if fcntl is not None:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-    else:
-        # Windows: no fcntl. Use msvcrt advisory lock with spin/backoff so
-        # parallel sessions (the documented multi-process case) queue instead
-        # of raising "Resource deadlock avoided" under contention.
-        import msvcrt as _ms
-        import time as _t
-        waited = 0.0
-        while True:
-            try:
-                _ms.locking(lock.fileno(), _ms.LK_NBLCK, 1)
-                break
-            except OSError:
-                if waited > 30.0:
-                    raise
-                _t.sleep(min(0.01 + waited * 0.2, 0.25))
-                waited += 0.01
-        _orig_close = lock.close
-        def _close():
-            try:
-                _ms.locking(lock.fileno(), _ms.LK_UNLCK, 1)
-            except Exception:
-                pass
-            _orig_close()
-        lock.close = _close
-    return lock
-
-
 def log_append(d, items):
-    """Append memories, items = [(date, text)]. The only way LOG.txt ever
-    changes. Ids are assigned INSIDE the lock: two sessions noting at the same
-    moment must not be handed the same id. Returns the first id used."""
-    lock = locked(d)
-    try:
-        repair(log_path(d), LOG_REC)
-        base = log_len(d)
-        with open(log_path(d), "ab") as f:
-            for k, (date, text) in enumerate(items):
-                f.write(pad("#%d %s %s" % (base + k, date, text), LOG_REC))
-            f.flush()
-            os.fsync(f.fileno())
-        return base
-    finally:
-        lock.close()
-
+    """Caller holds the Memory Worker lock for this prefix."""
+    repair(log_path(d), LOG_REC)
+    base = log_len(d)
+    content = b"".join(pad("#%d %s %s" % (base + k, date, text), LOG_REC)
+                       for k, (date, text) in enumerate(items))
+    FILES.append(log_path(d), content)
+    return base
 
 def tree_put(d, lo, hi, text):
-    """Write block [lo,hi). Blocks are built in order, so this only ever
-    appends one record to one level file."""
+    """Preserve conditional sequential append; caller owns the prefix lock."""
     size = hi - lo
-    lock = locked(d)
-    try:
-        p = tree_path(d, size)
-        repair(p, TREE_REC)
-        if count(p, TREE_REC) != lo // size:
-            return False
-        with open(p, "ab") as f:
-            f.write(pad(text, TREE_REC))
-            f.flush()
-            os.fsync(f.fileno())
-        return True
-    finally:
-        lock.close()
-
+    p = tree_path(d, size)
+    repair(p, TREE_REC)
+    if count(p, TREE_REC) != lo // size:
+        return False
+    FILES.append(p, pad(text, TREE_REC))
+    return True
 
 def tree_drop(d, lo, hi):
-    """Forget block [lo,hi) and every block built from it, by truncating each
-    level back to that point. Later blocks at those levels go too and are
-    rebuilt; the log is never touched, so nothing is lost."""
-    gone, size = [], hi - lo
-    lock = locked(d)
-    try:
-        while size <= log_len(d):
-            p, k = tree_path(d, size), lo // size
-            n = count(p, TREE_REC)
-            if n > k:
-                gone += [(i * size, (i + 1) * size) for i in range(k, n)]
-                with open(p, "r+b") as f:
-                    f.truncate(k * TREE_REC)
-            size *= 2
-        return gone
-    finally:
-        lock.close()
-
+    """Invalidate the same suffixes as upstream, atomically across levels."""
+    gone, files, size = [], [], hi - lo
+    while size <= log_len(d):
+        p, k = tree_path(d, size), lo // size
+        n = count(p, TREE_REC)
+        if n > k:
+            gone += [(i * size, (i + 1) * size) for i in range(k, n)]
+            files.append((p, k * TREE_REC))
+        size *= 2
+    FILES.truncate_many(files)
+    return gone
 
 def die(msg):
     print(msg, file=sys.stderr)
@@ -549,10 +457,9 @@ def cmd_init(d, args):
     only ever creates what is missing, and never rewrites what is there."""
     if args:
         die("usage: %s init" % ME)
-    fresh = not os.path.isdir(d)
-    os.makedirs(os.path.join(d, "TREE"), exist_ok=True)
-    open(log_path(d), "a").close()
-    if not os.path.exists(os.path.join(d, "config")):
+    fresh = not FILES.exists(log_path(d))
+    FILES.create(log_path(d))
+    if not FILES.exists(os.path.join(d, "config")):
         write_config(d, {})
     config(d)
     if fresh:
@@ -829,6 +736,17 @@ COMMANDS = {"init": cmd_init, "wake": cmd_wake, "note": cmd_note,
 
 
 def main():
+    global FILES
+    parser = argparse.ArgumentParser(description="OptMem FileRedis; caller must hold the memory-prefix lock.")
+    parser.add_argument("--redis-url", required=True)
+    parser.add_argument("--memory-prefix", required=True)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    options = parser.parse_args()
+    try:
+        FILES = FileRedis(options.redis_url, options.memory_prefix)
+    except ValueError:
+        die("Invalid FileRedis connection or memory prefix.")
+    sys.argv = [sys.argv[0]] + options.command
     usage = __doc__.strip().format(memo=ME)
     if len(sys.argv) < 2:
         print(usage)
@@ -839,15 +757,15 @@ def main():
         print(usage, file=sys.stderr)
         sys.exit(1)
     try:
-        # `init` is the only command that may run without an existing memory:
-        # it is the one that creates it. Every other command refuses, so a
-        # typo in MEMORY_DIR is an error instead of a second, empty identity.
+        # Only init may create the Redis files of a new memory prefix.
         if cmd == "init":
             cmd_init(memory_dir(), sys.argv[2:])
             return
         d = store()
         config(d)
         COMMANDS[cmd](d, sys.argv[2:])
+    except redis.RedisError as e:
+        die("FileRedis operation failed (%s)." % type(e).__name__)
     except OSError as e:
         # The filesystem is the one thing the tool does not control. Report it
         # the way every other failure is reported: a Python traceback tells an
@@ -856,4 +774,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if FILES is not None:
+            FILES.close()
